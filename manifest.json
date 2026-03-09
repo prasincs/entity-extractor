@@ -1,0 +1,9 @@
+{
+  "id": "entity-extractor",
+  "name": "Entity Extractor",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Extract people and concepts from book notes using Claude AI",
+  "author": "Prasanna Gautam",
+  "isDesktopOnly": false
+}
