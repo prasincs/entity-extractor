@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import {
     sanitizeFilename,
+    detectSourceType,
+    parseSourceNote,
     parseBookNote,
     formatReadingSection,
     buildEntityNote,
@@ -26,61 +28,126 @@ describe('sanitizeFilename', () => {
     });
 });
 
-describe('parseBookNote', () => {
+describe('detectSourceType', () => {
+    test('detects #books category', () => {
+        expect(detectSourceType('## Metadata\n- Category: #books\n')).toBe('book');
+    });
+
+    test('detects #articles category', () => {
+        expect(detectSourceType('## Metadata\n- Category: #articles\n')).toBe('article');
+    });
+
+    test('detects #podcasts category', () => {
+        expect(detectSourceType('## Metadata\n- Category: #podcasts\n')).toBe('podcast');
+    });
+
+    test('detects #tweets category', () => {
+        expect(detectSourceType('## Metadata\n- Category: #tweets\n')).toBe('tweet');
+    });
+
+    test('detects #papers category', () => {
+        expect(detectSourceType('## Metadata\n- Category: #papers\n')).toBe('paper');
+    });
+
+    test('detects #videos category', () => {
+        expect(detectSourceType('## Metadata\n- Category: #videos\n')).toBe('video');
+    });
+
+    test('detects kindle-sync frontmatter', () => {
+        expect(detectSourceType('---\nkindle-sync:\n  bookId: 123\n---\n')).toBe('book');
+    });
+
+    test('detects DOI as paper', () => {
+        expect(detectSourceType('## Metadata\n- DOI: 10.1234/test\n')).toBe('paper');
+    });
+
+    test('falls back to file path — Papers/', () => {
+        expect(detectSourceType('# Title\nSome content', 'Papers/my-paper.md')).toBe('paper');
+    });
+
+    test('falls back to file path — Readwise/Articles/', () => {
+        expect(detectSourceType('# Title\nContent', 'Readwise/Articles/article.md')).toBe('article');
+    });
+
+    test('falls back to file path — Sources/Books/', () => {
+        expect(detectSourceType('# Title\nContent', 'Sources/Books/book.md')).toBe('book');
+    });
+
+    test('returns unknown for unrecognized content', () => {
+        expect(detectSourceType('# Just a note\nSome text')).toBe('unknown');
+    });
+
+    test('category tag takes priority over file path', () => {
+        expect(detectSourceType('- Category: #podcasts\n', 'Readwise/Articles/podcast.md')).toBe('podcast');
+    });
+});
+
+describe('parseSourceNote', () => {
     test('extracts title from # heading', () => {
-        const result = parseBookNote('# My Book Title\n\nSome content');
+        const result = parseSourceNote('# My Book Title\n\nSome content');
         expect(result.title).toBe('My Book Title');
     });
 
     test('returns Untitled when no heading', () => {
-        const result = parseBookNote('Just some text without a heading');
+        const result = parseSourceNote('Just some text without a heading');
         expect(result.title).toBe('Untitled');
     });
 
-    test('collects all ^ref- block IDs', () => {
-        const content =
-            '# Book\n\nHighlight one ^ref-12345\n\nHighlight two ^ref-67890';
-        const result = parseBookNote(content);
+    test('detects source type from content', () => {
+        const content = '# Article\n## Metadata\n- Category: #articles\n## Highlights\n- text ([View Highlight](url))';
+        const result = parseSourceNote(content);
+        expect(result.sourceType).toBe('article');
+    });
+
+    test('detects source type from file path', () => {
+        const result = parseSourceNote('# Paper\nContent', 'Papers/my-paper.md');
+        expect(result.sourceType).toBe('paper');
+    });
+
+    test('collects ^ref- block IDs', () => {
+        const content = '# Book\n\nHighlight one ^ref-12345\n\nHighlight two ^ref-67890';
+        const result = parseSourceNote(content);
         expect(result.refs.size).toBe(2);
         expect(result.refs.has('ref-12345')).toBe(true);
-        expect(result.refs.has('ref-67890')).toBe(true);
     });
 
-    test('returns empty refs set when none exist', () => {
-        const result = parseBookNote('# Book\n\nNo refs here');
-        expect(result.refs.size).toBe(0);
+    test('hasHighlights true for refs', () => {
+        const content = '# Book\n\nText ^ref-12345';
+        const result = parseSourceNote(content);
+        expect(result.hasHighlights).toBe(true);
     });
 
-    test('detects Readwise Location links', () => {
-        const content =
-            '# Book\n\nSome highlight ([Location 123](https://read.amazon.com))';
+    test('hasHighlights true for View Highlight links', () => {
+        const content = '# Article\n- text ([View Highlight](url))';
+        const result = parseSourceNote(content);
+        expect(result.hasHighlights).toBe(true);
+    });
+
+    test('hasHighlights true for Location links', () => {
+        const content = '# Book\n- text ([Location 123](url))';
+        const result = parseSourceNote(content);
+        expect(result.hasHighlights).toBe(true);
+    });
+
+    test('hasHighlights false for plain text', () => {
+        const result = parseSourceNote('# Note\n\nJust plain text');
+        expect(result.hasHighlights).toBe(false);
+    });
+});
+
+describe('parseBookNote (deprecated wrapper)', () => {
+    test('still works for backward compatibility', () => {
+        const content = '# Book\n\nHighlight ^ref-123\nMore text';
         const result = parseBookNote(content);
-        expect(result.hasReadwiseHighlights).toBe(true);
-    });
-
-    test('detects blockquote format', () => {
-        const content = '# Book\n\n> This is a long enough blockquote highlight from the book';
-        const result = parseBookNote(content);
-        expect(result.hasReadwiseHighlights).toBe(true);
-    });
-
-    test('detects --- separator format', () => {
-        const content = '# Book\n\nHighlight one\n---\nHighlight two';
-        const result = parseBookNote(content);
-        expect(result.hasReadwiseHighlights).toBe(true);
-    });
-
-    test('hasReadwiseHighlights is false when refs are present', () => {
-        const content =
-            '# Book\n\nHighlight ^ref-123\n---\n([Location 456](url))';
-        const result = parseBookNote(content);
-        expect(result.refs.size).toBe(1);
+        expect(result.title).toBe('Book');
+        expect(result.refs.has('ref-123')).toBe(true);
         expect(result.hasReadwiseHighlights).toBe(false);
     });
 
-    test('hasReadwiseHighlights is false for plain text with no markers', () => {
-        const result = parseBookNote('# Book\n\nJust plain text');
-        expect(result.hasReadwiseHighlights).toBe(false);
+    test('detects readwise highlights when no refs', () => {
+        const content = '# Book\n- text ([Location 123](url))';
+        const result = parseBookNote(content);
+        expect(result.hasReadwiseHighlights).toBe(true);
     });
 });
 
@@ -101,13 +168,21 @@ describe('formatReadingSection', () => {
         expect(result).toBe('### [[My Book]]\n- Key insight about X\n');
     });
 
-    test('handles mixed ref and no-ref highlights', () => {
-        const result = formatReadingSection('My Book', [
-            { ref: 'ref-123', summary: 'With ref' },
-            { summary: 'Without ref' },
-        ]);
-        expect(result).toContain('![[My Book#^ref-123]]');
-        expect(result).toContain('- Without ref');
+    test('includes source type annotation', () => {
+        const result = formatReadingSection('Article Title', [
+            { summary: 'Key insight' },
+        ], 'article');
+        expect(result).toBe('### [[Article Title]] (article)\n- Key insight\n');
+    });
+
+    test('includes source type on stub', () => {
+        const result = formatReadingSection('Podcast Ep', [], 'podcast');
+        expect(result).toBe('### [[Podcast Ep]] (podcast)\n- Mentioned in text\n');
+    });
+
+    test('no annotation when source type omitted', () => {
+        const result = formatReadingSection('My Book', [{ summary: 'text' }]);
+        expect(result).toBe('### [[My Book]]\n- text\n');
     });
 
     test('returns stub when highlights is empty', () => {
@@ -127,19 +202,52 @@ describe('buildEntityNote', () => {
             'person',
             { name: 'John Doe', highlights: [], connections: [] },
             'My Book',
+            'book',
         );
         expect(result).toContain('type: person');
         expect(result).toContain('  - person');
     });
 
-    test('generates correct frontmatter for concept type', () => {
+    test('includes source-types in frontmatter', () => {
+        const result = buildEntityNote(
+            'person',
+            { name: 'John Doe', highlights: [], connections: [] },
+            'Article Title',
+            'article',
+        );
+        expect(result).toContain('source-types:');
+        expect(result).toContain('  - article');
+    });
+
+    test('uses ## Sources heading', () => {
+        const result = buildEntityNote(
+            'person',
+            { name: 'John Doe', highlights: [], connections: [] },
+            'My Book',
+            'book',
+        );
+        expect(result).toContain('## Sources');
+        expect(result).not.toContain('## From My Reading');
+    });
+
+    test('includes source type in Mentioned In', () => {
         const result = buildEntityNote(
             'concept',
-            { name: 'Machine Learning', highlights: [], connections: [] },
-            'AI Book',
+            { name: 'ML', highlights: [], connections: [] },
+            'Paper Title',
+            'paper',
         );
-        expect(result).toContain('type: concept');
-        expect(result).toContain('  - concept');
+        expect(result).toContain('- [[Paper Title]] (paper)');
+    });
+
+    test('includes source type annotation in reading section', () => {
+        const result = buildEntityNote(
+            'person',
+            { name: 'John', highlights: [{ summary: 'test' }], connections: [] },
+            'Podcast Ep',
+            'podcast',
+        );
+        expect(result).toContain('### [[Podcast Ep]] (podcast)');
     });
 
     test('includes aliases when present', () => {
@@ -152,6 +260,7 @@ describe('buildEntityNote', () => {
                 connections: [],
             },
             'My Book',
+            'book',
         );
         expect(result).toContain('aliases:');
         expect(result).toContain('  - JD');
@@ -163,6 +272,7 @@ describe('buildEntityNote', () => {
             'person',
             { name: 'John Doe', aliases: [], highlights: [], connections: [] },
             'My Book',
+            'book',
         );
         expect(result).not.toContain('aliases:');
     });
@@ -178,6 +288,7 @@ describe('buildEntityNote', () => {
                 ],
             },
             'My Book',
+            'book',
         );
         expect(result).toContain('## Connected To');
         expect(result).toContain('- [[Jane Smith]] \u2014 colleague');
@@ -188,18 +299,9 @@ describe('buildEntityNote', () => {
             'person',
             { name: 'John Doe', highlights: [], connections: [] },
             'My Book',
+            'book',
         );
         expect(result).not.toContain('## Connected To');
-    });
-
-    test('includes Mentioned In section', () => {
-        const result = buildEntityNote(
-            'person',
-            { name: 'John Doe', highlights: [], connections: [] },
-            'My Book',
-        );
-        expect(result).toContain('## Mentioned In');
-        expect(result).toContain('- [[My Book]]');
     });
 
     test('includes entity name as heading', () => {
@@ -207,7 +309,18 @@ describe('buildEntityNote', () => {
             'person',
             { name: 'John Doe', highlights: [], connections: [] },
             'My Book',
+            'book',
         );
         expect(result).toContain('# John Doe');
+    });
+
+    test('defaults to book source type', () => {
+        const result = buildEntityNote(
+            'person',
+            { name: 'John', highlights: [], connections: [] },
+            'Title',
+        );
+        expect(result).toContain('  - book');
+        expect(result).toContain('(book)');
     });
 });

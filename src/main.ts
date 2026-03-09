@@ -2,18 +2,17 @@ import { Plugin, Modal, PluginSettingTab, Setting, TFile, Notice, App } from 'ob
 import { generateEncKey, encryptStr, decryptStr } from './crypto';
 import {
     SYSTEM_PROMPT,
-    EXTRACTION_PROMPT_WITH_REFS,
-    EXTRACTION_PROMPT_NO_REFS,
+    buildExtractionPrompt,
     DEFAULT_SETTINGS,
 } from './constants';
 import type { EntityExtractorSettings } from './constants';
 import {
     sanitizeFilename,
-    parseBookNote,
+    parseSourceNote,
     formatReadingSection,
     buildEntityNote,
 } from './helpers';
-import type { Entity } from './helpers';
+import type { Entity, SourceType, SourceInfo } from './helpers';
 
 interface ExtractionResult {
     name: string;
@@ -41,7 +40,7 @@ export default class EntityExtractorPlugin extends Plugin {
 
         this.addCommand({
             id: 'extract-entities',
-            name: 'Extract entities from current book note',
+            name: 'Extract entities from current note',
             checkCallback: (checking: boolean) => {
                 const file = this.app.workspace.getActiveFile();
                 if (file && file.extension === 'md') {
@@ -70,6 +69,26 @@ export default class EntityExtractorPlugin extends Plugin {
                             console.error('Entity Extractor:', e);
                             new Notice(
                                 'Entity extraction error: ' + (e.message || e),
+                                10000,
+                            );
+                        });
+                    return true;
+                }
+                return false;
+            },
+        });
+
+        this.addCommand({
+            id: 'extract-entities-folder',
+            name: 'Extract entities from all notes in current folder',
+            checkCallback: (checking: boolean) => {
+                const file = this.app.workspace.getActiveFile();
+                if (file && file.extension === 'md') {
+                    if (!checking)
+                        this.runBatchExtraction().catch((e) => {
+                            console.error('Entity Extractor:', e);
+                            new Notice(
+                                'Batch extraction error: ' + (e.message || e),
                                 10000,
                             );
                         });
@@ -248,7 +267,8 @@ export default class EntityExtractorPlugin extends Plugin {
     async createOrMergeNote(
         type: string,
         entity: Entity,
-        bookTitle: string,
+        sourceTitle: string,
+        sourceType: SourceType,
         dryRun: boolean,
     ): Promise<{ action: string; path: string; count?: number }> {
         const folder = type === 'person' ? 'People' : 'Concepts';
@@ -259,28 +279,32 @@ export default class EntityExtractorPlugin extends Plugin {
         if (existing && existing instanceof TFile) {
             const content = await this.app.vault.read(existing);
 
-            if (content.includes('[[' + bookTitle + ']]')) {
+            if (content.includes('[[' + sourceTitle + ']]')) {
                 return { action: 'skip', path };
             }
 
             if (!dryRun) {
                 let updated = content;
                 const newSection = formatReadingSection(
-                    bookTitle,
+                    sourceTitle,
                     entity.highlights,
+                    sourceType,
                 );
-                const mentionedLine = '- [[' + bookTitle + ']]';
+                const mentionedLine = '- [[' + sourceTitle + ']] (' + sourceType + ')';
 
+                // Insert new source section — check for new heading first, fall back to legacy
                 if (updated.includes('## Connected To')) {
                     updated = updated.replace(
                         '## Connected To',
                         newSection + '\n## Connected To',
                     );
+                } else if (updated.includes('## Sources')) {
+                    updated += '\n' + newSection;
                 } else if (updated.includes('## From My Reading')) {
                     updated += '\n' + newSection;
                 }
 
-                if (!updated.includes(mentionedLine)) {
+                if (!updated.includes('[[' + sourceTitle + ']]')) {
                     if (updated.includes('## Mentioned In')) {
                         updated = updated.replace(
                             '## Mentioned In',
@@ -292,13 +316,21 @@ export default class EntityExtractorPlugin extends Plugin {
                     }
                 }
 
+                // Add source type to frontmatter if not already present
+                if (!updated.includes('  - ' + sourceType)) {
+                    updated = updated.replace(
+                        /^(source-types:\n)/m,
+                        '$1  - ' + sourceType + '\n',
+                    );
+                }
+
                 await this.app.vault.modify(existing, updated);
             }
             return { action: 'merge', path };
         }
 
         if (!dryRun) {
-            const note = buildEntityNote(type, entity, bookTitle);
+            const note = buildEntityNote(type, entity, sourceTitle, sourceType);
             await this.app.vault.create(path, note);
         }
         return {
@@ -320,25 +352,23 @@ export default class EntityExtractorPlugin extends Plugin {
             }
 
             const content = await this.app.vault.read(file);
-            const parsed = parseBookNote(content);
-            const { title, refs } = parsed;
+            const parsed = parseSourceNote(content, file.path);
+            const { title, sourceType, refs } = parsed;
             const hasRefs = refs.size > 0;
 
-            if (!hasRefs && !parsed.hasReadwiseHighlights) {
+            if (!parsed.hasHighlights) {
                 new Notice(
-                    'No highlights found in this note (no ^ref- markers or Readwise highlights).',
+                    'No highlights found in this note.',
                     5000,
                 );
                 return;
             }
 
-            const promptTemplate = hasRefs
-                ? EXTRACTION_PROMPT_WITH_REFS
-                : EXTRACTION_PROMPT_NO_REFS;
+            const promptTemplate = buildExtractionPrompt(sourceType, hasRefs);
 
             const mode = dryRun ? ' (DRY RUN)' : '';
             new Notice(
-                'Extracting entities from "' + title + '"...' + mode,
+                'Extracting entities from "' + title + '" (' + sourceType + ')...' + mode,
                 5000,
             );
 
@@ -388,6 +418,7 @@ export default class EntityExtractorPlugin extends Plugin {
                         'person',
                         person,
                         title,
+                        sourceType,
                         dryRun,
                     );
                     results.push({
@@ -401,6 +432,7 @@ export default class EntityExtractorPlugin extends Plugin {
                         'concept',
                         concept,
                         title,
+                        sourceType,
                         dryRun,
                     );
                     results.push({
@@ -443,6 +475,75 @@ export default class EntityExtractorPlugin extends Plugin {
             );
         }
     }
+
+    async runBatchExtraction() {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (!activeFile) {
+            new Notice('No active file — open a file in the target folder first.', 5000);
+            return;
+        }
+
+        const apiKey = await this.getApiKey();
+        if (!apiKey) {
+            new Notice(
+                'No API key configured. Go to Settings → Entity Extractor.',
+                8000,
+            );
+            return;
+        }
+
+        const parentPath = activeFile.parent?.path || '';
+        const allFiles = this.app.vault.getMarkdownFiles().filter(
+            (f) => f.parent?.path === parentPath,
+        );
+
+        // Filter to files that haven't been processed yet
+        const toProcess: TFile[] = [];
+        for (const f of allFiles) {
+            const content = await this.app.vault.read(f);
+            if (!content.includes('## Entities')) {
+                const parsed = parseSourceNote(content, f.path);
+                if (parsed.hasHighlights) {
+                    toProcess.push(f);
+                }
+            }
+        }
+
+        if (toProcess.length === 0) {
+            new Notice('No unprocessed notes with highlights found in ' + (parentPath || 'root'), 5000);
+            return;
+        }
+
+        new Notice(
+            'Batch extraction: ' + toProcess.length + ' notes in ' + (parentPath || 'root') + '. Starting...',
+            5000,
+        );
+
+        let processed = 0;
+        let errors = 0;
+        for (const file of toProcess) {
+            processed++;
+            try {
+                new Notice(
+                    'Processing ' + processed + '/' + toProcess.length + ': ' + file.basename,
+                    3000,
+                );
+                await this.runExtraction(file, false);
+                // Rate limit delay — 2 seconds between API calls
+                if (processed < toProcess.length) {
+                    await new Promise((r) => setTimeout(r, 2000));
+                }
+            } catch (e: any) {
+                errors++;
+                console.error('Entity Extractor: batch error on ' + file.path, e);
+            }
+        }
+
+        new Notice(
+            'Batch complete: ' + processed + ' processed, ' + errors + ' errors.',
+            8000,
+        );
+    }
 }
 
 /* ============================================================
@@ -450,18 +551,18 @@ export default class EntityExtractorPlugin extends Plugin {
  * ============================================================ */
 
 class ResultsModal extends Modal {
-    private bookTitle: string;
+    private sourceTitle: string;
     private results: ExtractionResult[];
     private dryRun: boolean;
 
     constructor(
         app: App,
-        bookTitle: string,
+        sourceTitle: string,
         results: ExtractionResult[],
         dryRun: boolean,
     ) {
         super(app);
-        this.bookTitle = bookTitle;
+        this.sourceTitle = sourceTitle;
         this.results = results;
         this.dryRun = dryRun;
     }
@@ -479,7 +580,7 @@ class ResultsModal extends Modal {
         ).length;
 
         const heading = this.dryRun
-            ? 'Dry Run: ' + this.bookTitle
+            ? 'Dry Run: ' + this.sourceTitle
             : 'Extraction Complete';
         contentEl.createEl('h2', { text: heading });
 
@@ -492,8 +593,8 @@ class ResultsModal extends Modal {
                 ? 'Would process ' +
                   this.results.length +
                   ' entities from ' +
-                  this.bookTitle
-                : parts.join(', ') + ' — from ' + this.bookTitle,
+                  this.sourceTitle
+                : parts.join(', ') + ' — from ' + this.sourceTitle,
         });
 
         const people = this.results.filter((r) => r.type === 'person');
@@ -559,7 +660,7 @@ class ResultsModal extends Modal {
 
         const legend = this.dryRun
             ? 'Run without "dry run" to create these notes.'
-            : '+ created, ~ merged with existing, = already had this book';
+            : '+ created, ~ merged with existing, = already had this source';
         contentEl.createEl('p', {
             text: legend,
             cls: 'setting-item-description',
@@ -592,7 +693,6 @@ class EntityExtractorSettingTab extends PluginSettingTab {
 
         const hasKey = !!plugin.settings.encryptedApiKey;
 
-        // API Key
         let apiKeyInput: any;
         new Setting(containerEl)
             .setName('Anthropic API key')
@@ -701,11 +801,11 @@ class EntityExtractorSettingTab extends PluginSettingTab {
         const usage = containerEl.createEl('div');
         usage.createEl('ol', {}, (ol) => {
             ol.createEl('li', {
-                text: 'Open a book note with highlights (Kindle ^ref- markers or Readwise format)',
+                text: 'Open a note with highlights (books, articles, papers, podcasts, videos)',
             });
             ol.createEl('li', { text: 'Open Command Palette (Cmd/Ctrl + P)' });
             ol.createEl('li', {
-                text: 'Run "Entity Extractor: Extract entities from current book note"',
+                text: 'Run "Entity Extractor: Extract entities from current note"',
             });
             ol.createEl('li', {
                 text: 'Entity notes appear in People/ and Concepts/ folders',
@@ -715,7 +815,7 @@ class EntityExtractorSettingTab extends PluginSettingTab {
             cls: 'setting-item-description',
         });
         tip.setText(
-            'Use "Extract entities (dry run)" to preview what would be created without writing any files.',
+            'Use "dry run" to preview, or "all notes in folder" for batch processing.',
         );
     }
 }
